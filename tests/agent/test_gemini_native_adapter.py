@@ -326,3 +326,45 @@ def test_stream_event_translation_keeps_identical_calls_in_distinct_parts():
     assert tool_chunks[0].choices[0].delta.tool_calls[0].index == 0
     assert tool_chunks[1].choices[0].delta.tool_calls[0].index == 1
     assert tool_chunks[0].choices[0].delta.tool_calls[0].id != tool_chunks[1].choices[0].delta.tool_calls[0].id
+
+
+def test_translate_stream_event_reports_usage_metadata():
+    from agent.gemini_native_adapter import translate_stream_event
+
+    event = {
+        "usageMetadata": {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 50,
+            "totalTokenCount": 150,
+            "cachedContentTokenCount": 10
+        }
+    }
+
+    # Case 1: Usage-only event (often the final chunk)
+    chunks = translate_stream_event(event, model="gemini-3-flash-preview", tool_call_indices={})
+    assert len(chunks) == 1
+    usage = chunks[0].usage
+    assert usage.prompt_tokens == 100
+    assert usage.completion_tokens == 50
+    assert usage.total_tokens == 150
+    assert usage.prompt_tokens_details.cached_tokens == 10
+
+    # Case 2: Event with content and usage
+    event_with_content = {
+        "candidates": [{"content": {"parts": [{"text": "hello"}]}}],
+        **event
+    }
+    chunks = translate_stream_event(event_with_content, model="gemini-3-flash-preview", tool_call_indices={})
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    assert chunks[0].usage.total_tokens == 150
+
+    # Case 3: Event with finish_reason and usage
+    event_with_finish = {
+        "candidates": [{"finishReason": "STOP"}],
+        **event
+    }
+    chunks = translate_stream_event(event_with_finish, model="gemini-3-flash-preview", tool_call_indices={})
+    # One chunk for finish_reason, which should have usage attached
+    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.total_tokens == 150
