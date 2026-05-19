@@ -551,6 +551,7 @@ def _make_stream_chunk(
     tool_call_delta: Optional[Dict[str, Any]] = None,
     finish_reason: Optional[str] = None,
     reasoning: str = "",
+    usage: Optional[Any] = None,
 ) -> _GeminiStreamChunk:
     delta_kwargs: Dict[str, Any] = {
         "role": "assistant",
@@ -586,7 +587,7 @@ def _make_stream_chunk(
         created=int(time.time()),
         model=model,
         choices=[choice],
-        usage=None,
+        usage=usage,
     )
 
 
@@ -616,9 +617,24 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
 
 
 def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices: Dict[str, Dict[str, Any]]) -> List[_GeminiStreamChunk]:
+    usage_meta = event.get("usageMetadata")
+    usage = None
+    if usage_meta:
+        usage = SimpleNamespace(
+            prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
+            completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
+            total_tokens=int(usage_meta.get("totalTokenCount") or 0),
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
+            ),
+        )
+
     candidates = event.get("candidates") or []
     if not candidates:
+        if usage:
+            return [_make_stream_chunk(model=model, usage=usage)]
         return []
+
     cand = candidates[0] if isinstance(candidates[0], dict) else {}
     parts = ((cand.get("content") or {}).get("parts") or []) if isinstance(cand, dict) else []
     chunks: List[_GeminiStreamChunk] = []
@@ -679,21 +695,15 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
     finish_reason_raw = str(cand.get("finishReason") or "")
     if finish_reason_raw:
         mapped = "tool_calls" if tool_call_indices else _map_gemini_finish_reason(finish_reason_raw)
-        finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped)
-        # Attach usage from this event's usageMetadata so the streaming
-        # loop in run_agent.py can record token counts (mirrors the
-        # non-streaming path in translate_gemini_response).
-        usage_meta = event.get("usageMetadata") or {}
-        if usage_meta:
-            finish_chunk.usage = SimpleNamespace(
-                prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
-                completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
-                total_tokens=int(usage_meta.get("totalTokenCount") or 0),
-                prompt_tokens_details=SimpleNamespace(
-                    cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
-                ),
-            )
+        finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped, usage=usage)
         chunks.append(finish_chunk)
+    elif usage:
+        # Event has usage but no finish reason (likely a mid-stream or final usage-only event)
+        if chunks:
+            chunks[-1].usage = usage
+        else:
+            chunks.append(_make_stream_chunk(model=model, usage=usage))
+
     return chunks
 
 
